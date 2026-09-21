@@ -11,102 +11,167 @@ Self-hosted anonymous-letter platform with optional Spotify tracks.
 - Publish/unpublish selected letters
 - Spotify track search and attachment
 - Basic rate limiting + honeypot
-- SQLite locally, PostgreSQL in production
+- MariaDB/MySQL production database
+- Gunicorn on port 8001 so it can coexist with another app on port 8000
 
-## Local
+## Ubuntu VPS deployment (existing MariaDB)
+
+Clone into `/opt/unsaid`:
+
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-flask --app app run --debug
-```
-
-## Spotify
-Create an app in the Spotify Developer Dashboard. Put its Client ID and Client Secret in `.env`. Unsaid uses Spotify Client Credentials for track search.
-
-## Ubuntu VPS: Gunicorn + Nginx + PostgreSQL
-```bash
-sudo apt update
-sudo apt install -y python3-venv python3-pip nginx postgresql postgresql-contrib git
-sudo mkdir -p /opt/unsaid
-sudo chown $USER:$USER /opt/unsaid
-git clone git@github.com:wnyova/Unsaid.git /opt/unsaid
+cd /opt
+sudo git clone https://github.com/wnyova/Unsaid.git unsaid
+sudo chown -R $USER:$USER /opt/unsaid
 cd /opt/unsaid
 python3 -m venv .venv
 source .venv/bin/activate
+pip install --upgrade pip
 pip install -r requirements.txt
-sudo -u postgres psql
-```
-Then in PostgreSQL:
-```sql
-CREATE USER unsaid WITH PASSWORD 'CHANGE_THIS_PASSWORD';
-CREATE DATABASE unsaid OWNER unsaid;
-\q
-```
-Configure:
-```bash
-cp .env.example .env
-nano .env
-```
-Production example:
-```env
-SECRET_KEY=generate-a-long-random-secret
-DATABASE_URL=postgresql+psycopg://unsaid:CHANGE_THIS_PASSWORD@127.0.0.1/unsaid
-BASE_URL=https://your-domain.example
-SPOTIFY_CLIENT_ID=...
-SPOTIFY_CLIENT_SECRET=...
-```
-Generate a secret:
-```bash
-python3 -c "import secrets; print(secrets.token_hex(32))"
 ```
 
+### MariaDB
+
+Use the existing MariaDB service, but create a separate database and account:
+
+```bash
+sudo mariadb
+```
+
+```sql
+CREATE DATABASE unsaid CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER 'unsaid'@'localhost' IDENTIFIED BY 'CHANGE_THIS_PASSWORD';
+GRANT ALL PRIVILEGES ON unsaid.* TO 'unsaid'@'localhost';
+FLUSH PRIVILEGES;
+EXIT;
+```
+
+Test it:
+
+```bash
+mariadb -u unsaid -p unsaid
+```
+
+### Environment
+
+```bash
+cd /opt/unsaid
+cp .env.example .env
+python3 -c "import secrets; print(secrets.token_hex(32))"
+nano .env
+```
+
+Example:
+
+```env
+SECRET_KEY=YOUR_GENERATED_SECRET
+DATABASE_URL=mysql+pymysql://unsaid:CHANGE_THIS_PASSWORD@127.0.0.1:3306/unsaid?charset=utf8mb4
+BASE_URL=http://192.168.0.139:8001
+SPOTIFY_CLIENT_ID=
+SPOTIFY_CLIENT_SECRET=
+```
+
+If the database password contains URL-reserved characters, URL-encode it or use a long alphanumeric password.
+
+Initialize tables:
+
+```bash
+cd /opt/unsaid
+source .venv/bin/activate
+python -c "from app import app; print('Unsaid database initialized')"
+mariadb -u unsaid -p unsaid -e "SHOW TABLES;"
+```
+
+### Test on LAN
+
+```bash
+cd /opt/unsaid
+source .venv/bin/activate
+gunicorn --workers 2 --bind 0.0.0.0:8001 app:app
+```
+
+Open `http://192.168.0.139:8001`. This does not use or modify port 8000.
+
+### systemd
+
 Create `/etc/systemd/system/unsaid.service`:
+
 ```ini
 [Unit]
 Description=Unsaid web app
-After=network.target postgresql.service
+After=network.target mariadb.service
+
 [Service]
 User=YOUR_LINUX_USER
 Group=www-data
 WorkingDirectory=/opt/unsaid
 EnvironmentFile=/opt/unsaid/.env
-ExecStart=/opt/unsaid/.venv/bin/gunicorn --workers 2 --bind 127.0.0.1:8000 app:app
+ExecStart=/opt/unsaid/.venv/bin/gunicorn --workers 2 --bind 127.0.0.1:8001 app:app
 Restart=on-failure
+RestartSec=5
 PrivateTmp=true
+
 [Install]
 WantedBy=multi-user.target
 ```
-Enable it:
+
+Then:
+
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now unsaid
+sudo systemctl status unsaid
 ```
 
-Nginx `/etc/nginx/sites-available/unsaid`:
+For direct LAN access instead, bind to `0.0.0.0:8001`; for a public deployment behind Nginx, keep `127.0.0.1:8001`.
+
+### Nginx
+
+Create `/etc/nginx/sites-available/unsaid`:
+
 ```nginx
 server {
- listen 80;
- server_name your-domain.example;
- client_max_body_size 1m;
- location / {
-  proxy_pass http://127.0.0.1:8000;
-  proxy_set_header Host $host;
-  proxy_set_header X-Real-IP $remote_addr;
-  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-  proxy_set_header X-Forwarded-Proto $scheme;
- }
+    listen 80;
+    server_name your-domain.example;
+
+    client_max_body_size 1m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
 }
 ```
+
+Enable it:
+
 ```bash
 sudo ln -s /etc/nginx/sites-available/unsaid /etc/nginx/sites-enabled/unsaid
-sudo nginx -t && sudo systemctl reload nginx
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+For HTTPS:
+
+```bash
 sudo apt install -y certbot python3-certbot-nginx
 sudo certbot --nginx -d your-domain.example
 ```
 
-Update later:
+Then change `BASE_URL` in `.env` to the final HTTPS URL and restart:
+
+```bash
+sudo systemctl restart unsaid
+```
+
+## Spotify
+
+Create an app in the Spotify Developer Dashboard and place its Client ID and Client Secret in `.env`. Unsaid uses Spotify Client Credentials for track search; senders do not need to log into Spotify.
+
+## Updating later
+
 ```bash
 cd /opt/unsaid
 git pull
@@ -115,7 +180,9 @@ pip install -r requirements.txt
 sudo systemctl restart unsaid
 ```
 
-Before large public use, add Redis-backed rate limiting, CSRF protection, report/moderation controls, privacy/terms pages, deliberate proxy log retention, and CAPTCHA/Turnstile.
+## Production note
+
+Before broad public use, add persistent/Redis-backed rate limiting, CSRF protection, report/moderation controls, privacy/terms pages, CAPTCHA/Turnstile, and a deliberate proxy-log retention policy.
 
 ## License
 MIT
